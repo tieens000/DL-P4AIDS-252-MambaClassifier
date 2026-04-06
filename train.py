@@ -6,8 +6,14 @@ huấn luyện :class:`src.models.model.MambaClassifier` với AdamW, scheduler
 giảm LR theo validation loss, early stopping và ghi log lên Weights & Biases.
 """
 
+import random
+import subprocess
+from pathlib import Path
+
+import numpy as np
 import torch
 from datasets import load_dataset
+from sklearn.metrics import confusion_matrix, f1_score
 from torch.nn.utils import clip_grad_norm_
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -119,10 +125,44 @@ def get_default_config():
         "num_classes": 3,  # uitnlp/vietnamese_students_feedback: sentiment 0/1/2
         "dropout": 0.1,
         "learning_rate": 2e-4,
+        "weight_decay": 0.01,
         "batch_size": 32,
         "num_epochs": 3,
         "max_length": 512,
+        "max_grad_norm": 1.0,
+        "seed": 42,
+        "dataset_name": "uitnlp/vietnamese_students_feedback",
+        "tokenizer_name": "vinai/phobert-base",
+        "scheduler_mode": "min",
+        "scheduler_factor": 0.5,
+        "scheduler_patience": 2,
+        "max_patience": 5,
     }
+
+
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _try_git_revision() -> str:
+    root = Path(__file__).resolve().parent
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return "unknown"
 
 
 def _prep_hf_split(split_ds):
@@ -144,8 +184,8 @@ def prepare_data(config):
     Returns:
         Tuple (train_loader, test_loader, tokenizer).
     """
-    dataset = load_dataset("uitnlp/vietnamese_students_feedback")
-    tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base")
+    dataset = load_dataset(config["dataset_name"])
+    tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_name"])
 
     train_src = _prep_hf_split(dataset["train"])
     test_src = _prep_hf_split(dataset["test"])
@@ -208,7 +248,7 @@ def setup_model(config, tokenizer):
     return model, device
 
 
-def train_epoch(model, train_loader, optimizer, device):
+def train_epoch(model, train_loader, optimizer, device, max_grad_norm: float):
     """
     Một epoch huấn luyện: forward, backward, clip gradient, cập nhật trọng số.
     Args:
@@ -236,7 +276,7 @@ def train_epoch(model, train_loader, optimizer, device):
 
         optimizer.zero_grad()
         loss.backward()
-        clip_grad_norm_(model.parameters(), max_norm=1.0)
+        clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
         optimizer.step()
 
         predictions = torch.argmax(logits, dim=1)
@@ -251,20 +291,24 @@ def train_epoch(model, train_loader, optimizer, device):
     return train_loss / len(train_loader), train_correct / train_total
 
 
-def evaluate(model, test_loader, device):
+def evaluate(model, test_loader, device, num_classes: int):
     """
     Đánh giá trên tập kiểm tra (không backward).
     Args:
         model: MambaClassifier
         test_loader: DataLoader cho tập kiểm tra
         device: Thiết bị (CUDA / MPS / CPU)
+        num_classes: Số lớp (cho confusion matrix / F1)
     Returns:
-        Tuple (loss_trung_bình, accuracy_trên_test).
+        Tuple (loss_trung_bình, accuracy_trên_test, dict_metrics).
+        dict_metrics gồm f1_macro, f1_weighted, f1_per_class, y_true, y_pred.
     """
     model.eval()
     test_loss = 0
     test_correct = 0
     test_total = 0
+    all_preds: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
 
     with torch.no_grad():
         for batch in test_loader:
@@ -276,8 +320,27 @@ def evaluate(model, test_loader, device):
             predictions = torch.argmax(outputs["logits"], dim=1)
             test_correct += (predictions == labels).sum().item()
             test_total += labels.size(0)
+            all_preds.append(predictions.detach().cpu())
+            all_labels.append(labels.detach().cpu())
 
-    return test_loss / len(test_loader), test_correct / test_total
+    avg_loss = test_loss / len(test_loader)
+    acc = test_correct / test_total
+    y_pred = torch.cat(all_preds).numpy()
+    y_true = torch.cat(all_labels).numpy()
+    f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    f1_weighted = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+    f1_per = f1_score(y_true, y_pred, average=None, zero_division=0)
+    f1_per_list = [float(x) for x in np.atleast_1d(f1_per).ravel()]
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+    extra = {
+        "f1_macro": f1_macro,
+        "f1_weighted": f1_weighted,
+        "f1_per_class": f1_per_list,
+        "confusion_matrix": cm,
+        "y_true": y_true,
+        "y_pred": y_pred,
+    }
+    return avg_loss, acc, extra
 
 
 def save_checkpoint(model, optimizer, epoch, test_acc):
@@ -311,45 +374,122 @@ def train():
     Returns:
         None
     """
-    wandb.init(project="mamba-classification")
-    config = get_default_config() # Lấy siêu tham số mặc định
-    train_loader, test_loader, tokenizer = prepare_data(config) # Tải dữ liệu và tạo DataLoader
-    model, device = setup_model(config, tokenizer) # Khởi tạo mô hình và chọn thiết bị
+    config = get_default_config()
+    _set_seed(config["seed"])
+    train_loader, test_loader, tokenizer = prepare_data(config)
+    model, device = setup_model(config, tokenizer)
+    n_params = sum(p.numel() for p in model.parameters())
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"]) # Khởi tạo optimizer
+    wb_config = {
+        **config,
+        "optimizer_type": "AdamW",
+        "scheduler_type": "ReduceLROnPlateau",
+        "model/total_parameters": n_params,
+        "tokenizer_vocab_size": tokenizer.vocab_size,
+        "device": str(device),
+        "git_revision": _try_git_revision(),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+    run = wandb.init(project="mamba-classification", config=wb_config)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+    )
     scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2, verbose=True
-    ) # Khởi tạo scheduler
+        optimizer,
+        mode=config["scheduler_mode"],
+        factor=config["scheduler_factor"],
+        patience=config["scheduler_patience"],
+        verbose=True,
+    )
 
-    best_test_acc = 0 # Độ chính xác tốt nhất
-    patience_counter = 0 # Số epoch không cải thiện
-    max_patience = 5 # Số epoch tối đa không cải thiện
+    best_test_acc = 0.0
+    best_test_f1_weighted = 0.0
+    patience_counter = 0
+    max_patience = config["max_patience"]
+    class_names = [str(i) for i in range(config["num_classes"])]
 
-    for epoch in range(config["num_epochs"]): # Vòng lặp epoch
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, device)
-        test_loss, test_acc = evaluate(model, test_loader, device)
+    for epoch in range(config["num_epochs"]):
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, device, config["max_grad_norm"]
+        )
+        test_loss, test_acc, test_ex = evaluate(
+            model, test_loader, device, config["num_classes"]
+        )
+        best_test_f1_weighted = max(best_test_f1_weighted, test_ex["f1_weighted"])
 
+        lr = optimizer.param_groups[0]["lr"]
         metrics = {
+            "epoch": epoch + 1,
             "train_loss": train_loss,
             "train_acc": train_acc,
             "test_loss": test_loss,
             "test_acc": test_acc,
+            "test_f1_macro": test_ex["f1_macro"],
+            "test_f1_weighted": test_ex["f1_weighted"],
+            "learning_rate": lr,
         }
+        for i, f1c in enumerate(test_ex["f1_per_class"]):
+            metrics[f"test_f1_class_{i}"] = f1c
+
+        try:
+            metrics["test/confusion_matrix"] = wandb.plot.confusion_matrix(
+                probs=None,
+                y_true=test_ex["y_true"],
+                preds=test_ex["y_pred"],
+                class_names=class_names,
+            )
+        except Exception:
+            pass
+
+        cm = test_ex["confusion_matrix"]
+        cm_rows = [
+            [ti, pj, int(cm[ti, pj])]
+            for ti in range(cm.shape[0])
+            for pj in range(cm.shape[1])
+        ]
+        metrics["test/confusion_counts"] = wandb.Table(
+            columns=["true", "pred", "count"], data=cm_rows
+        )
+
         wandb.log(metrics)
-        print(f"Epoch {epoch+1} metrics:", metrics)
+        print(
+            f"Epoch {epoch + 1}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+            f"test_loss={test_loss:.4f} test_acc={test_acc:.4f} "
+            f"f1_macro={test_ex['f1_macro']:.4f} f1_weighted={test_ex['f1_weighted']:.4f} "
+            f"lr={lr:.2e}"
+        )
 
         scheduler.step(test_loss)
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
             save_checkpoint(model, optimizer, epoch, test_acc)
+            artifact = wandb.Artifact(
+                f"best-model-{run.id}",
+                type="model",
+                metadata={
+                    "epoch": epoch + 1,
+                    "test_acc": float(test_acc),
+                    "test_f1_weighted": test_ex["f1_weighted"],
+                    "test_f1_macro": test_ex["f1_macro"],
+                },
+            )
+            artifact.add_file("best_model.pt")
+            run.log_artifact(artifact)
             patience_counter = 0
         else:
             patience_counter += 1
 
         if patience_counter >= max_patience:
-            print(f"Early stopping triggered after epoch {epoch+1}")
+            print(f"Early stopping triggered after epoch {epoch + 1}")
             break
+
+    wandb.summary["best_test_acc"] = best_test_acc
+    wandb.summary["best_test_f1_weighted"] = best_test_f1_weighted
 
 
 if __name__ == "__main__":
