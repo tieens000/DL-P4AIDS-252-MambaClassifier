@@ -1,3 +1,7 @@
+"""
+Đầu phân loại phía sau backbone: pooling theo trục chuỗi → LayerNorm → Linear.
+"""
+
 import torch
 import torch.nn as nn
 
@@ -5,12 +9,12 @@ import torch.nn as nn
 class ClassifierHead(nn.Module):
     def __init__(self, d_model: int, num_classes: int, dropout: float = 0.1):
         """
-        Simple classifier head that takes sequence output and predicts classes.
+        Mean pooling trên chiều ``seq_len``, chuẩn hóa và chiếu xuống ``num_classes``.
 
         Args:
-            d_model: Hidden dimension size from the Mamba model
-            num_classes: Number of classification categories
-            dropout: Dropout rate (default: 0.1)
+            d_model: Chiều đặc trưng mỗi bước thời gian (khớp đầu ra backbone).
+            num_classes: Số lớp phân loại.
+            dropout: Xác suất dropout trước lớp tuyến tính cuối.
         """
         super().__init__()
         self.dropout = nn.Dropout(dropout)
@@ -20,9 +24,10 @@ class ClassifierHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Tensor of shape (batch_size, seq_len, d_model)
+            x: ``(batch_size, seq_len, d_model)`` — đầu ra chuỗi từ Mamba.
+
         Returns:
-            Tensor of shape (batch_size, num_classes)
+            Logits ``(batch_size, num_classes)``.
         """
         # Average pooling over sequence length
         x = x.mean(dim=1)  # (batch_size, d_model)

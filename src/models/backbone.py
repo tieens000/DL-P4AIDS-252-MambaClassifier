@@ -1,3 +1,19 @@
+"""
+Lõi kiến trúc Mamba (PyTorch): cấu hình, xếp chồng tầng residual, khối SSM.
+
+Tham khảo triển khai ``mamba_simple`` / **mamba-minimal** (johnma2006). Khác
+biệt chính: conv 1D bằng ``nn.Conv1d``, selective scan thuần PyTorch (hoặc
+tuần tự / CUDA qua ``mamba_ssm`` nếu bật).
+
+Cấu trúc module:
+
+- ``Mamba``: nhiều ``ResidualBlock``.
+- ``ResidualBlock``: ``ResidualBlock(x) = MambaBlock(RMSNorm(x)) + x``.
+- ``MambaBlock``: nhánh ``in_proj`` tách ``x, z``; conv1d depthwise + SiLU
+  trên ``x``; SSM (selective scan); nhân có điều kiện với ``silu(z)`` rồi
+  ``out_proj`` (Hình 3 bài Mamba).
+"""
+
 import math
 from dataclasses import dataclass
 from typing import Union
@@ -8,29 +24,37 @@ import torch.nn.functional as F
 
 from src.utils.pscan import pscan
 
-"""
-
-This file closely follows the mamba_simple.py from the official Mamba implementation, and the mamba-minimal by @johnma2006.
-The major differences are :
--the convolution is done with torch.nn.Conv1d
--the selective scan is done in PyTorch
-
-A sequential version of the selective scan is also available for comparison. Also, it is possible to use the official Mamba implementation.
-
-This is the structure of the torch modules :
-- A Mamba model is composed of several layers, which are ResidualBlock.
-- A ResidualBlock is composed of a MambaBlock, a normalization, and a residual connection : ResidualBlock(x) = mamba(norm(x)) + x
-- This leaves us with the MambaBlock : its input x is (B, L, D) and its outputs y is also (B, L, D) (B=batch size, L=seq len, D=model dim).
-First, we expand x into (B, L, 2*ED) (where E is usually 2) and split it into x and z, each (B, L, ED).
-Then, we apply the short 1d conv to x, followed by an activation function (silu), then the SSM.
-We then multiply it by silu(z).
-See Figure 3 of the paper (page 8) for a visual representation of a MambaBlock.
-
-"""
-
 
 @dataclass
 class MambaConfig:
+    """
+    Hyperparameters for Mamba architecture
+
+    Args:
+        d_model: Dimension của input
+        n_layers: Số lượng layers
+        dt_rank: Rank của tensor delta
+        d_state: Dimension của state
+        expand_factor: Hệ số mở rộng cho inner dimension
+        d_conv: Kích thước kernel của convolution
+        dt_min: Giá trị tối thiểu cho tensor delta
+        dt_max: Giá trị tối đa cho tensor delta
+        dt_init: Phương pháp khởi tạo cho tensor delta
+        dt_scale: Hệ số scale cho tensor delta
+        dt_init_floor: Giá trị floor cho tensor delta
+        rms_norm_eps: Epsilon cho RMSNorm
+        base_std: Standard deviation cơ bản cho RMSNorm
+        bias: Bias cho các layer tuyến tính
+        conv_bias: Bias cho layer convolution
+        inner_layernorms: Whether to apply layernorms to the internal activations
+        mup: Whether to use muP
+        mup_base_width: Base width for muP
+        pscan: Whether to use parallel scan mode
+        use_cuda: Whether to use CUDA implementation
+    Returns:
+        MambaConfig object
+    """
+
     d_model: int  # D
     n_layers: int
     dt_rank: Union[int, str] = "auto"
@@ -69,6 +93,14 @@ class MambaConfig:
 
 
 class Mamba(nn.Module):
+    """
+    Xếp chồng nhiều tầng ResidualBlock; forward xử lý cả chuỗi.
+    Args:
+        config: MambaConfig object
+    Returns:
+        Mamba object
+    """
+
     def __init__(self, config: MambaConfig):
         super().__init__()
 
@@ -79,6 +111,13 @@ class Mamba(nn.Module):
         )
 
     def forward(self, x):
+        """
+        Args:
+            x: ``(B, L, D)`` embedding chuỗi.
+
+        Returns:
+            ``(B, L, D)`` sau khi qua tất cả các tầng.
+        """
         # x : (B, L, D)
 
         # y : (B, L, D)
@@ -89,11 +128,17 @@ class Mamba(nn.Module):
         return x
 
     def step(self, x, caches):
-        # x : (B, L, D)
-        # caches : [cache(layer) for all layers], cache : (h, inputs)
+        """
+        Suy luận từng bước thời gian (một token): cập nhật ``caches`` mỗi tầng.
 
-        # y : (B, L, D)
-        # caches : [cache(layer) for all layers], cache : (h, inputs)
+        Args:
+            x: ``(B, D)`` — một bước embedding sau khi đã embed token hiện tại.
+            caches: List cache, mỗi phần tử ứng với một ``ResidualBlock``.
+
+        Returns:
+            Tuple ``(output, caches)`` với ``output`` ``(B, D)``.
+        """
+        # x : (B, D); caches : list of (h, inputs) per layer
 
         for i, layer in enumerate(self.layers):
             x, caches[i] = layer.step(x, caches[i])
@@ -102,6 +147,14 @@ class Mamba(nn.Module):
 
 
 class ResidualBlock(nn.Module):
+    """
+    ResidualBlock là một khối cơ bản của Mamba, bao gồm MambaBlock và RMSNorm.
+    Args:
+        config: MambaConfig object
+    Returns:
+        ResidualBlock object
+    """
+
     def __init__(self, config: MambaConfig):
         super().__init__()
 
@@ -109,21 +162,29 @@ class ResidualBlock(nn.Module):
         self.norm = RMSNorm(config.d_model, config.rms_norm_eps, config.mup)
 
     def forward(self, x):
-        # x : (B, L, D)
-
-        # output : (B, L, D)
+        """
+        Đi qua RMSNorm và MambaBlock, sau đó thêm vào skip connection.
+        Args:
+            x: (B, L, D)
+        Returns:
+            (B, L, D)
+        """
 
         output = self.mixer(self.norm(x)) + x
         return output
 
     def step(self, x, cache):
-        # x : (B, D)
-        # cache : (h, inputs)
-        # h : (B, ED, N)
-        # inputs: (B, ED, d_conv-1)
-
-        # output : (B, D)
-        # cache : (h, inputs)
+        """
+        Một bước thời gian với cache conv/SSM; x là (B, D).
+        Args:
+            x: (B, D)
+            cache: (h, inputs)
+            h: (B, ED, N)
+            inputs: (B, ED, d_conv-1)
+        Returns:
+            (B, D)
+            (h, inputs)
+        """
 
         output, cache = self.mixer.step(self.norm(x), cache)
         output = output + x
@@ -131,14 +192,23 @@ class ResidualBlock(nn.Module):
 
 
 class MambaBlock(nn.Module):
+    """
+    MambaBlock là một khối cơ bản của Mamba, bao gồm in_proj, conv1d, x_proj, dt_proj, A_log, D, out_proj.
+    Args:
+        config: MambaConfig object
+    Returns:
+        MambaBlock object
+    """
+
     def __init__(self, config: MambaConfig):
         super().__init__()
 
         self.config = config
 
-        # projects block input from D to 2*ED (two branches)
+        # Tách đầu vào thành hai nhánh
         self.in_proj = nn.Linear(config.d_model, 2 * config.d_inner, bias=config.bias)
 
+        # Conv1D theo thời gian
         self.conv1d = nn.Conv1d(
             in_channels=config.d_inner,
             out_channels=config.d_inner,
@@ -148,16 +218,16 @@ class MambaBlock(nn.Module):
             padding=config.d_conv - 1,
         )
 
-        # projects x to input-dependent delta, B, C
+        # Từ x -> delta, B, C
         self.x_proj = nn.Linear(
             config.d_inner, config.dt_rank + 2 * config.d_state, bias=False
         )
 
-        # projects delta from dt_rank to d_inner
+        # Từ delta -> d_inner
         self.dt_proj = nn.Linear(config.dt_rank, config.d_inner, bias=True)
 
-        # dt initialization
-        # dt weights
+        # Khởi tạo dt_proj
+        # dt_proj weights
         dt_init_std = config.dt_rank**-0.5 * config.dt_scale
         if config.dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
@@ -166,7 +236,7 @@ class MambaBlock(nn.Module):
         else:
             raise NotImplementedError
 
-        # delta bias
+        # Khởi tạo bias cho dt_proj
         dt = torch.exp(
             torch.rand(config.d_inner)
             * (math.log(config.dt_max) - math.log(config.dt_min))
@@ -174,28 +244,28 @@ class MambaBlock(nn.Module):
         ).clamp(min=config.dt_init_floor)
         inv_dt = dt + torch.log(
             -torch.expm1(-dt)
-        )  # inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        )  # Nghịch đảo của softplus: https://github.com/pytorch/pytorch/issues/72759
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
-        # self.dt_proj.bias._no_reinit = True # initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
-        # todo : explain why removed
+        # self.dt_proj.bias._no_reinit = True # Khởi tạo sẽ set tất cả bias của Linear về 0, cần đánh dấu bias này là _no_reinit
 
-        # S4D real initialization
+        # Khởi tạo A_log
         A = torch.arange(1, config.d_state + 1, dtype=torch.float32).repeat(
             config.d_inner, 1
         )
         self.A_log = nn.Parameter(
             torch.log(A)
-        )  # why store A in log ? to keep A < 0 (cf -torch.exp(...)) ? for gradient stability ?
+        )  # Tại sao lưu A trong log ? để giữ A < 0 (cf -torch.exp(...)) ? cho gradient stability ?
         self.A_log._no_weight_decay = True
 
+        # Khởi tạo D
         self.D = nn.Parameter(torch.ones(config.d_inner))
         self.D._no_weight_decay = True
 
-        # projects block output from ED back to D
+        # Từ d_inner -> d_model
         self.out_proj = nn.Linear(config.d_inner, config.d_model, bias=config.bias)
 
-        # used in jamba
+        # Sử dụng trong Jamba
         if self.config.inner_layernorms:
             self.dt_layernorm = RMSNorm(
                 self.config.dt_rank, config.rms_norm_eps, config.mup
@@ -221,6 +291,15 @@ class MambaBlock(nn.Module):
                 self.config.use_cuda = False
 
     def _apply_layernorms(self, dt, B, C):
+        """
+        Áp RMSNorm nội bộ cho Δ, B, C.
+        Args:
+            dt: (B, L, dt_rank)
+            B: (B, L, N)
+            C: (B, L, N)
+        Returns:
+            (B, L, dt_rank), (B, L, N), (B, L, N)
+        """
         if self.dt_layernorm is not None:
             dt = self.dt_layernorm(dt)
         if self.B_layernorm is not None:
@@ -230,67 +309,86 @@ class MambaBlock(nn.Module):
         return dt, B, C
 
     def forward(self, x):
+        """
+        Đi qua in_proj, conv1d, x_proj, dt_proj, A_log, D, out_proj.
+        Args:
+            x: (B, L, D)
+        Returns:
+            (B, L, D)
+        """
         # x : (B, L, D)
-
-        # y : (B, L, D)
-
         _, L, _ = x.shape
+        # Tách đầu vào thành hai nhánh
+        xz = self.in_proj(x)  # (B, L, 2*d_inner)
+        x, z = xz.chunk(2, dim=-1)  # (B, L, d_inner), (B, L, d_inner)
 
-        xz = self.in_proj(x)  # (B, L, 2*ED)
-        x, z = xz.chunk(2, dim=-1)  # (B, L, ED), (B, L, ED)
-
-        # x branch
-        x = x.transpose(1, 2)  # (B, ED, L)
+        # Nhánh x
+        # Chuyển đổi shape từ (B, L, d_inner) -> (B, d_inner, L)
+        x = x.transpose(1, 2)  # (B, d_inner, L)
         x = self.conv1d(x)[
             :, :, :L
-        ]  # depthwise convolution over time, with a short filter
-        x = x.transpose(1, 2)  # (B, L, ED)
+        ]  # Convolution theo thời gian, với bộ lọc ngắn
+        x = x.transpose(1, 2)  # (B, L, d_inner)
 
+        # Áp activation function SiLU
         x = F.silu(x)
+
+        # Đi qua SSM
         y = self.ssm(x, z)
 
         if self.config.use_cuda:
             output = self.out_proj(y)  # (B, L, D)
-            return output  # the rest of the operations are done in the ssm function (fused with the CUDA pscan)
+            return output  # Các phép toán còn lại được thực hiện trong hàm ssm (fused với CUDA pscan)
 
-        # z branch
+        # Nhánh z
+        # Áp activation function SiLU
         z = F.silu(z)
 
+        # Nhân hai nhánh
         output = y * z
+
+        # Đi qua out_proj
         output = self.out_proj(output)  # (B, L, D)
 
         return output
 
     def ssm(self, x, z):
-        # x : (B, L, ED)
+        """
+        State Space Model với tham số phụ thuộc đầu vào: tính Δ, B, C, quét selective.
+        Args:
+            x: (B, L, d_inner)
+            z: (B, L, d_inner)
+        Returns:
+            (B, L, d_inner)
+        """
 
-        # y : (B, L, ED)
-
-        A = -torch.exp(self.A_log.float())  # (ED, N)
+        A = -torch.exp(self.A_log.float())  # (d_inner, N)
         D = self.D.float()
 
-        deltaBC = self.x_proj(x)  # (B, L, dt_rank+2*N)
+        deltaBC = self.x_proj(x)  # (B, L, dt_rank+2*d_state)
         delta, B, C = torch.split(
             deltaBC,
             [self.config.dt_rank, self.config.d_state, self.config.d_state],
             dim=-1,
         )  # (B, L, dt_rank), (B, L, N), (B, L, N)
+        # Áp RMSNorm nội bộ cho Δ, B, C (inner_layernorms=True)
         delta, B, C = self._apply_layernorms(delta, B, C)
+        # Áp ma trận nhân cho delta
         delta = self.dt_proj.weight @ delta.transpose(
             1, 2
         )  # (ED, dt_rank) @ (B, L, dt_rank) -> (B, ED, L)
         # here we just apply the matrix mul operation of delta = softplus(dt_proj(delta))
         # the rest will be applied later (fused if using cuda)
 
-        # choose which selective_scan function to use, according to config
+        # Chọn hàm selective_scan tương ứng với config
         if self.config.use_cuda:
-            # these are unfortunately needed for the selective_scan_cuda function
+            # Đây là các thứ cần thiết cho hàm selective_scan_cuda
             x = x.transpose(1, 2)
             B = B.transpose(1, 2)
             C = C.transpose(1, 2)
             z = z.transpose(1, 2)
 
-            # "softplus" + "bias" + "y * silu(z)" operations are fused
+            # "softplus" + "bias" + "y * silu(z)" các phép toán được gộp
             y = self.selective_scan_cuda(
                 x,
                 delta,
@@ -302,12 +400,14 @@ class MambaBlock(nn.Module):
                 delta_softplus=True,
                 delta_bias=self.dt_proj.bias.float(),
             )
-            y = y.transpose(1, 2)  # (B, L, ED)
+            y = y.transpose(1, 2)  # (B, L, d_inner)
 
         else:
+            # Áp ma trận nhân cho delta = softplus(dt_proj(delta))
             delta = delta.transpose(1, 2)
             delta = F.softplus(delta + self.dt_proj.bias)
 
+            # Chọn hàm selective_scan tương ứng với config
             if self.config.pscan:
                 y = self.selective_scan(x, delta, A, B, C, D)
             else:
@@ -316,61 +416,69 @@ class MambaBlock(nn.Module):
         return y
 
     def selective_scan(self, x, delta, A, B, C, D):
-        # x : (B, L, ED)
-        # Δ : (B, L, ED)
-        # A : (ED, N)
-        # B : (B, L, N)
-        # C : (B, L, N)
-        # D : (ED)
+        """
+        Selective scan song song qua PScan.
+        Args:
+            x: (B, L, d_inner)
+            delta: (B, L, d_inner)
+            A: (d_inner, N)
+            B: (B, L, N)
+            C: (B, L, N)
+            D: (d_inner)
+        Returns:
+            (B, L, d_inner)
+        """
 
-        # y : (B, L, ED)
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, d_inner, N)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, d_inner, N)
 
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, ED, N)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, ED, N)
-
-        BX = deltaB * (x.unsqueeze(-1))  # (B, L, ED, N)
+        BX = deltaB * (x.unsqueeze(-1))  # (B, L, d_inner, N)
 
         hs = pscan(deltaA, BX)
 
         y = (hs @ C.unsqueeze(-1)).squeeze(
             3
-        )  # (B, L, ED, N) @ (B, L, N, 1) -> (B, L, ED, 1)
+        )  # (B, L, d_inner, N) @ (B, L, N, 1) -> (B, L, d_inner, 1)
 
         y = y + D * x
 
         return y
 
     def selective_scan_seq(self, x, delta, A, B, C, D):
-        # x : (B, L, ED)
-        # Δ : (B, L, ED)
-        # A : (ED, N)
-        # B : (B, L, N)
-        # C : (B, L, N)
-        # D : (ED)
-
-        # y : (B, L, ED)
+        """
+        Selective scan tuần tự.
+        Args:
+            x: (B, L, d_inner)
+            delta: (B, L, d_inner)
+            A: (d_inner, N)
+            B: (B, L, N)
+            C: (B, L, N)
+            D: (d_inner)
+        Returns:
+            (B, L, d_inner)
+        """
 
         _, L, _ = x.shape
 
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, ED, N)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, ED, N)
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, d_inner, N)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, d_inner, N)
 
-        BX = deltaB * (x.unsqueeze(-1))  # (B, L, ED, N)
+        BX = deltaB * (x.unsqueeze(-1))  # (B, L, d_inner, N)
 
         h = torch.zeros(
             x.size(0), self.config.d_inner, self.config.d_state, device=deltaA.device
-        )  # (B, ED, N)
+        )  # (B, d_inner, N)
         hs = []
 
         for t in range(0, L):
             h = deltaA[:, t] * h + BX[:, t]
             hs.append(h)
 
-        hs = torch.stack(hs, dim=1)  # (B, L, ED, N)
+        hs = torch.stack(hs, dim=1)  # (B, L, d_inner, N)
 
         y = (hs @ C.unsqueeze(-1)).squeeze(
             3
-        )  # (B, L, ED, N) @ (B, L, N, 1) -> (B, L, ED, 1)
+        )  # (B, L, d_inner, N) @ (B, L, N, 1) -> (B, L, d_inner, 1)
 
         y = y + D * x
 
@@ -399,66 +507,72 @@ class MambaBlock(nn.Module):
     """
 
     def step(self, x, cache):
-        # x : (B, D)
-        # cache : (h, inputs)
-        # h : (B, ED, N)
-        # inputs : (B, ED, d_conv-1)
-
-        # y : (B, D)
-        # cache : (h, inputs)
-
+        """
+        Một bước thời gian với cache conv/SSM; x là (B, D).
+        Args:
+            x: (B, D)
+            cache: (h, inputs)
+            h: (B, d_inner, N)
+            inputs: (B, d_inner, d_conv-1)
+        Returns:
+            (B, D)
+            (h, inputs)
+        """
         h, inputs = cache
 
-        xz = self.in_proj(x)  # (B, 2*ED)
-        x, z = xz.chunk(2, dim=1)  # (B, ED), (B, ED)
+        xz = self.in_proj(x)  # (B, 2*d_inner)
+        x, z = xz.chunk(2, dim=1)  # (B, d_inner), (B, d_inner)
 
-        # x branch
+        # Nhánh x
         x_cache = x.unsqueeze(2)
         x = self.conv1d(torch.cat([inputs, x_cache], dim=2))[
             :, :, self.config.d_conv - 1
-        ]  # (B, ED)
+        ]  # (B, d_inner)
 
         x = F.silu(x)
         y, h = self.ssm_step(x, h)
 
-        # z branch
+        # Nhánh z
         z = F.silu(z)
 
         output = y * z
         output = self.out_proj(output)  # (B, D)
 
-        # prepare cache for next call
-        inputs = torch.cat([inputs[:, :, 1:], x_cache], dim=2)  # (B, ED, d_conv-1)
+        # Chuẩn bị cache cho lời gọi tiếp theo
+        inputs = torch.cat([inputs[:, :, 1:], x_cache], dim=2)  # (B, d_inner, d_conv-1)
         cache = (h, inputs)
 
         return output, cache
 
     def ssm_step(self, x, h):
-        # x : (B, ED)
-        # h : (B, ED, N)
-
-        # y : (B, ED)
-        # h : (B, ED, N)
-
+        """
+        Một bước SSM với trạng thái ẩn h; dùng cho step.
+        Args:
+            x: (B, d_inner)
+            h: (B, d_inner, N)
+        Returns:
+            (B, d_inner)
+            (h, inputs)
+        """
         A = -torch.exp(
             self.A_log.float()
-        )  # (ED, N) # todo : ne pas le faire tout le temps, puisque c'est indépendant de la timestep
+        )  # (d_inner, N) # todo : ne pas le faire tout le temps, puisque c'est indépendant de la timestep
         D = self.D.float()
 
-        deltaBC = self.x_proj(x)  # (B, dt_rank+2*N)
+        deltaBC = self.x_proj(x)  # (B, dt_rank+2*d_state)
 
         delta, B, C = torch.split(
             deltaBC,
             [self.config.dt_rank, self.config.d_state, self.config.d_state],
             dim=-1,
-        )  # (B, dt_rank), (B, N), (B, N)
+        )  # (B, dt_rank), (B, d_state), (B, d_state)
         delta, B, C = self._apply_layernorms(delta, B, C)
-        delta = F.softplus(self.dt_proj(delta))  # (B, ED)
+        delta = F.softplus(self.dt_proj(delta))  # (B, d_inner)
 
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, ED, N)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(1)  # (B, ED, N)
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, d_inner, N)
+        deltaB = delta.unsqueeze(-1) * B.unsqueeze(1)  # (B, d_inner, N)
 
-        BX = deltaB * (x.unsqueeze(-1))  # (B, ED, N)
+        BX = deltaB * (x.unsqueeze(-1))  # (B, d_inner, N)
 
         if h is None:
             h = torch.zeros(
@@ -466,11 +580,11 @@ class MambaBlock(nn.Module):
                 self.config.d_inner,
                 self.config.d_state,
                 device=deltaA.device,
-            )  # (B, ED, N)
+            )  # (B, d_inner, N)
 
-        h = deltaA * h + BX  # (B, ED, N)
+        h = deltaA * h + BX  # (B, d_inner, N)
 
-        y = (h @ C.unsqueeze(-1)).squeeze(2)  # (B, ED, N) @ (B, N, 1) -> (B, ED, 1)
+        y = (h @ C.unsqueeze(-1)).squeeze(2)  # (B, d_inner, N) @ (B, d_state, 1) -> (B, d_inner, 1)
 
         y = y + D * x
 
@@ -478,6 +592,10 @@ class MambaBlock(nn.Module):
 
 
 class RMSNorm(nn.Module):
+    """
+    Chuẩn hóa RMS; khi ``use_mup=True`` không dùng tham số scale (theo muP).
+    """
+
     def __init__(self, d_model: int, eps: float = 1e-5, use_mup: bool = False):
         super().__init__()
 
@@ -489,6 +607,13 @@ class RMSNorm(nn.Module):
             self.weight = nn.Parameter(torch.ones(d_model))
 
     def forward(self, x):
+        """
+        Scale theo độ lớn RMS của chiều cuối; nhân ``weight`` nếu không muP.
+        Args:
+            x: (B, L, d_inner)
+        Returns:
+            (B, L, d_inner)
+        """
         output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
         if not self.use_mup:

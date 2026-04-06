@@ -1,19 +1,28 @@
+"""
+Parallel prefix scan (Blelloch) trong PyTorch, dùng cho selective scan của Mamba.
+
+Tính truy hồi ``H[t] = A[t] * H[t-1] + X[t]`` với ``H[0]=0`` trong ~``O(log L)``
+bước song song thay vì ``O(L)`` tuần tự. Có ``torch.autograd.Function`` đầy đủ
+forward/backward; độ dài không phải lũy thừa 2 được pad lên ``npo2(L)``.
+
+Biến ``pscan`` ở cuối file là ``PScan.apply`` — API gọi trực tiếp từ ``backbone``.
+"""
+
 import math
 
 import torch
 import torch.nn.functional as F
 
-"""
-
-An implementation of the parallel scan operation in PyTorch (Blelloch version).
-Please see docs/pscan.ipynb for a detailed explanation of what happens here.
-
-"""
-
 
 def npo2(len):
     """
-    Returns the next power of 2 above len
+    Lũy thừa 2 nhỏ nhất ``>= len`` (ví dụ ``len=5`` → ``8``).
+
+    Args:
+        len: Độ dài cần làm tròn.
+
+    Returns:
+        Số nguyên lũy thừa của 2.
     """
 
     return 2 ** math.ceil(math.log2(len))
@@ -21,13 +30,13 @@ def npo2(len):
 
 def pad_npo2(X):
     """
-    Pads input length dim to the next power of 2
+    Đệm chiều thời gian ``L`` (trục 1) về ``npo2(L)`` bằng số 0.
 
     Args:
-        X : (B, L, D, N)
+        X: Tensor ``(B, L, D, N)``.
 
     Returns:
-        Y : (B, npo2(L), D, N)
+        Tensor ``(B, npo2(L), D, N)``.
     """
 
     len_npo2 = npo2(X.size(1))
@@ -36,8 +45,15 @@ def pad_npo2(X):
 
 
 class PScan(torch.autograd.Function):
+    """Hàm autograd: forward chạy scan song song; backward dùng ``pscan_rev``."""
+
     @staticmethod
     def pscan(A, X):
+        """
+        Up/down sweep Blelloch; sửa ``X`` tại chỗ thành prefix states ``H``.
+
+        Chỉ hỗ trợ ``L`` lũy thừa 2. Layout: ``A``, ``X`` là ``(B, D, L, N)``.
+        """
         # A : (B, D, L, N)
         # X : (B, D, L, N)
 
@@ -98,6 +114,9 @@ class PScan(torch.autograd.Function):
 
     @staticmethod
     def pscan_rev(A, X):
+        """
+        Phiên bản đảo chiều thời gian của ``pscan`` tĩnh; phục vụ lan truyền gradient lùi.
+        """
         # A : (B, D, L, N)
         # X : (B, D, L, N)
 
@@ -158,15 +177,16 @@ class PScan(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A_in, X_in):
         """
-        Applies the parallel scan operation, as defined above. Returns a new tensor.
-        If you can, privilege sequence lengths that are powers of two.
+        Parallel scan: trả về tensor ``H`` cùng shape đầu vào (sau cắt pad).
+
+        Nên dùng ``L`` là lũy thừa 2 để tránh pad thừa.
 
         Args:
-            A_in : (B, L, D, N)
-            X_in : (B, L, D, N)
+            A_in: ``(B, L, D, N)`` — hệ số nhân trạng thái theo thời gian.
+            X_in: ``(B, L, D, N)`` — số hạng bổ sung trong truy hồi.
 
         Returns:
-            H : (B, L, D, N)
+            ``H`` shape ``(B, L, D, N)``.
         """
 
         L = X_in.size(1)
@@ -195,14 +215,14 @@ class PScan(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output_in):
         """
-        Flows the gradient from the output to the input. Returns two new tensors.
+        Gradient đối với ``A_in`` và ``X_in`` qua scan ngược và nhân theo công thức đạo hàm.
 
         Args:
-            ctx : A_in : (B, L, D, N), X : (B, D, L, N)
-            grad_output_in : (B, L, D, N)
+            ctx: Chứa ``A_in``, ``X`` sau forward (đã transpose nội bộ).
+            grad_output_in: ``(B, L, D, N)``.
 
         Returns:
-            gradA : (B, L, D, N), gradX : (B, L, D, N)
+            Tuple ``(grad_A, grad_X)`` cùng layout với đầu vào forward.
         """
 
         A_in, X = ctx.saved_tensors
