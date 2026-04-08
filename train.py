@@ -120,15 +120,15 @@ def collate_fn(batch):
 def get_default_config():
     """Trả về dict siêu tham số mặc định cho mô hình và huấn luyện."""
     return {
-        "d_model": 256,
-        "n_layers": 4,
+        "d_model": 64,
+        "n_layers": 2,
         "num_classes": 3,  # uitnlp/vietnamese_students_feedback: sentiment 0/1/2
-        "dropout": 0.1,
-        "learning_rate": 2e-4,
-        "weight_decay": 0.01,
+        "dropout": 0.3,
+        "learning_rate": 5e-5,
+        "weight_decay": 0.1,
         "batch_size": 32,
-        "num_epochs": 3,
-        "max_length": 512,
+        "num_epochs": 20,
+        "max_length": 256,
         "max_grad_norm": 1.0,
         "seed": 42,
         "dataset_name": "uitnlp/vietnamese_students_feedback",
@@ -137,6 +137,7 @@ def get_default_config():
         "scheduler_factor": 0.5,
         "scheduler_patience": 2,
         "max_patience": 5,
+        "label_smoothing": 0.1,
     }
 
 
@@ -148,7 +149,11 @@ def _set_seed(seed: int) -> None:
 
 
 def _try_git_revision() -> str:
-    root = Path(__file__).resolve().parent
+    # Jupyter/Colab: __file__ is undefined when code runs from a notebook cell.
+    try:
+        root = Path(__file__).resolve().parent
+    except NameError:
+        root = Path.cwd()
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -176,31 +181,38 @@ def _prep_hf_split(split_ds):
 
 def prepare_data(config):
     """
-    Tải dữ liệu, token hóa train/test, tạo DataLoader.
+    Tải dữ liệu, token hóa train/validation/test, tạo DataLoader.
 
     Args:
         config: Phải chứa batch_size, max_length.
 
     Returns:
-        Tuple (train_loader, test_loader, tokenizer).
+        Tuple (train_loader, val_loader, test_loader, tokenizer).
     """
     dataset = load_dataset(config["dataset_name"])
     tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_name"])
 
     train_src = _prep_hf_split(dataset["train"])
+    val_src = _prep_hf_split(dataset["validation"])
     test_src = _prep_hf_split(dataset["test"])
 
-    tokenized_train = train_src.map(
-        lambda x: tokenize_function(
+    def _tokenize(x):
+        return tokenize_function(
             word_segment(standardize_data(x)), tokenizer, config["max_length"]
-        ),
+        )
+
+    tokenized_train = train_src.map(
+        _tokenize,
         batched=True,
         remove_columns=train_src.column_names,
     )
+    tokenized_val = val_src.map(
+        _tokenize,
+        batched=True,
+        remove_columns=val_src.column_names,
+    )
     tokenized_test = test_src.map(
-        lambda x: tokenize_function(
-            word_segment(standardize_data(x)), tokenizer, config["max_length"]
-        ),
+        _tokenize,
         batched=True,
         remove_columns=test_src.column_names,
     )
@@ -211,14 +223,18 @@ def prepare_data(config):
         shuffle=True,
         collate_fn=collate_fn,
     )
-    
+    val_loader = DataLoader(
+        tokenized_val,
+        batch_size=config["batch_size"],
+        collate_fn=collate_fn,
+    )
     test_loader = DataLoader(
         tokenized_test, 
         batch_size=config["batch_size"], 
         collate_fn=collate_fn
     )
 
-    return train_loader, test_loader, tokenizer
+    return train_loader, val_loader, test_loader, tokenizer
 
 
 def setup_model(config, tokenizer):
@@ -243,6 +259,7 @@ def setup_model(config, tokenizer):
         num_classes=config["num_classes"],
         dropout=config["dropout"],
         vocab_size=tokenizer.vocab_size,
+        label_smoothing=config["label_smoothing"],
     ).to(device)
     print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
     return model, device
@@ -364,19 +381,12 @@ def save_checkpoint(model, optimizer, epoch, test_acc):
 
 def train():
     """
-    Vòng huấn luyện đầy đủ: W&B, scheduler, lưu model khi test_acc tăng,
+    Vòng huấn luyện đầy đủ: W&B, scheduler, lưu model khi val_loss giảm,
     early stopping sau max_patience epoch không cải thiện.
-    Args:
-        config: Siêu tham số mặc định
-        train_loader: DataLoader cho tập huấn luyện
-        test_loader: DataLoader cho tập kiểm tra
-        tokenizer: Tokenizer
-    Returns:
-        None
     """
     config = get_default_config()
     _set_seed(config["seed"])
-    train_loader, test_loader, tokenizer = prepare_data(config)
+    train_loader, val_loader, test_loader, tokenizer = prepare_data(config)
     model, device = setup_model(config, tokenizer)
     n_params = sum(p.numel() for p in model.parameters())
 
@@ -406,7 +416,7 @@ def train():
         verbose=True,
     )
 
-    best_test_acc = 0.0
+    best_val_loss = float("inf")
     best_test_f1_weighted = 0.0
     patience_counter = 0
     max_patience = config["max_patience"]
@@ -415,6 +425,9 @@ def train():
     for epoch in range(config["num_epochs"]):
         train_loss, train_acc = train_epoch(
             model, train_loader, optimizer, device, config["max_grad_norm"]
+        )
+        val_loss, val_acc, val_ex = evaluate(
+            model, val_loader, device, config["num_classes"]
         )
         test_loss, test_acc, test_ex = evaluate(
             model, test_loader, device, config["num_classes"]
@@ -426,6 +439,10 @@ def train():
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "val_f1_macro": val_ex["f1_macro"],
+            "val_f1_weighted": val_ex["f1_weighted"],
             "test_loss": test_loss,
             "test_acc": test_acc,
             "test_f1_macro": test_ex["f1_macro"],
@@ -458,21 +475,24 @@ def train():
         wandb.log(metrics)
         print(
             f"Epoch {epoch + 1}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} "
             f"test_loss={test_loss:.4f} test_acc={test_acc:.4f} "
             f"f1_macro={test_ex['f1_macro']:.4f} f1_weighted={test_ex['f1_weighted']:.4f} "
             f"lr={lr:.2e}"
         )
 
-        scheduler.step(test_loss)
+        scheduler.step(val_loss)
 
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             save_checkpoint(model, optimizer, epoch, test_acc)
             artifact = wandb.Artifact(
                 f"best-model-{run.id}",
                 type="model",
                 metadata={
                     "epoch": epoch + 1,
+                    "val_loss": float(val_loss),
+                    "val_acc": float(val_acc),
                     "test_acc": float(test_acc),
                     "test_f1_weighted": test_ex["f1_weighted"],
                     "test_f1_macro": test_ex["f1_macro"],
@@ -488,7 +508,7 @@ def train():
             print(f"Early stopping triggered after epoch {epoch + 1}")
             break
 
-    wandb.summary["best_test_acc"] = best_test_acc
+    wandb.summary["best_val_loss"] = best_val_loss
     wandb.summary["best_test_f1_weighted"] = best_test_f1_weighted
 
 

@@ -19,6 +19,7 @@ class MambaClassifier(nn.Module):
         num_classes: int = 2,
         dropout: float = 0.1,
         vocab_size: Optional[int] = None,
+        label_smoothing: float = 0.0,
     ):
         """
         Mamba end-to-end cho phân loại (embedding + SSM + đầu FC).
@@ -28,8 +29,9 @@ class MambaClassifier(nn.Module):
                 Ví dụ: d_model = 16 nghĩa là mỗi từ được biểu diễn bởi 16 số thực
             n_layers: Số tầng ResidualBlock.
             num_classes: Số lớp logits. Ví dụ: num_classes = 10 nghĩa là có 10 lớp phân loại.
-            dropout: Tỷ lệ dropout trên đầu phân loại. Ví dụ: dropout = 0.1 nghĩa là 10% các neuron được dropout.
+            dropout: Tỷ lệ dropout trên đầu phân loại và backbone. Ví dụ: dropout = 0.1 nghĩa là 10% các neuron được dropout.
             vocab_size: Kích thước bảng từ vựng cho nn.Embedding.
+            label_smoothing: Hệ số label smoothing cho CrossEntropyLoss (0.0 = không smoothing).
         """
         super().__init__()
         if vocab_size is None:
@@ -39,7 +41,7 @@ class MambaClassifier(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
 
         # Khởi tạo backbone Mamba
-        config = MambaConfig(d_model=d_model, n_layers=n_layers)
+        config = MambaConfig(d_model=d_model, n_layers=n_layers, dropout=dropout)
         self.backbone = Mamba(config)
 
         # Khởi tạo đầu phân loại
@@ -48,7 +50,7 @@ class MambaClassifier(nn.Module):
         )
 
         # Khởi tạo hàm loss
-        self.loss_fct = nn.CrossEntropyLoss()
+        self.loss_fct = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> dict:
         """

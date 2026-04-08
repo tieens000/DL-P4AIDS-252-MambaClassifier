@@ -75,6 +75,8 @@ class MambaConfig:
     conv_bias: bool = True
     inner_layernorms: bool = False  # apply layernorms to internal activations
 
+    dropout: float = 0.1  # dropout rate for regularization inside MambaBlock
+
     mup: bool = False
     mup_base_width: float = 128  # width=d_model
 
@@ -204,6 +206,7 @@ class MambaBlock(nn.Module):
         super().__init__()
 
         self.config = config
+        self.dropout = nn.Dropout(config.dropout)
 
         # Tách đầu vào thành hai nhánh
         self.in_proj = nn.Linear(config.d_model, 2 * config.d_inner, bias=config.bias)
@@ -346,6 +349,9 @@ class MambaBlock(nn.Module):
 
         # Nhân hai nhánh
         output = y * z
+
+        # Áp dụng dropout trước out_proj để regularize
+        output = self.dropout(output)
 
         # Đi qua out_proj
         output = self.out_proj(output)  # (B, L, D)
