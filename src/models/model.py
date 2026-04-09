@@ -20,6 +20,7 @@ class MambaClassifier(nn.Module):
         dropout: float = 0.1,
         vocab_size: Optional[int] = None,
         label_smoothing: float = 0.0,
+        pretrained_embeddings: Optional[torch.Tensor] = None,
     ):
         """
         Mamba end-to-end cho phân loại (embedding + SSM + đầu FC).
@@ -32,13 +33,28 @@ class MambaClassifier(nn.Module):
             dropout: Tỷ lệ dropout trên đầu phân loại và backbone. Ví dụ: dropout = 0.1 nghĩa là 10% các neuron được dropout.
             vocab_size: Kích thước bảng từ vựng cho nn.Embedding.
             label_smoothing: Hệ số label smoothing cho CrossEntropyLoss (0.0 = không smoothing).
+            pretrained_embeddings: Tensor trọng số embedding pretrained (vocab_size, embed_dim).
+                Nếu được cung cấp, embedding sẽ được freeze và thêm projection layer
+                từ embed_dim xuống d_model.
         """
         super().__init__()
-        if vocab_size is None:
-            raise ValueError("vocab_size is required for nn.Embedding.")
 
-        # Thêm lớp embedding
-        self.embedding = nn.Embedding(vocab_size, d_model)
+        if pretrained_embeddings is not None:
+            # Dùng pretrained embedding (freeze để tránh overfit)
+            embed_dim = pretrained_embeddings.shape[1]  # VD: 768 với PhoBERT
+            self.embedding = nn.Embedding.from_pretrained(
+                pretrained_embeddings, freeze=True
+            )
+            # Projection: embed_dim (768) → d_model (128)
+            self.embed_proj = nn.Sequential(
+                nn.Linear(embed_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+        else:
+            if vocab_size is None:
+                raise ValueError("vocab_size is required when pretrained_embeddings is None.")
+            self.embedding = nn.Embedding(vocab_size, d_model)
+            self.embed_proj = None
 
         # Khởi tạo backbone Mamba
         config = MambaConfig(d_model=d_model, n_layers=n_layers, dropout=dropout)
@@ -54,7 +70,7 @@ class MambaClassifier(nn.Module):
 
     def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> dict:
         """
-        Luồng xuôi: embedding → backbone → logits; tùy chọn tính loss.
+        Luồng xuôi: embedding → (projection) → backbone → logits; tùy chọn tính loss.
 
         Args:
             x: Tensor (B, L, 1) (token id dạng float) hoặc tương thích.
@@ -65,6 +81,10 @@ class MambaClassifier(nn.Module):
         """
         # Áp dụng embedding
         x = self.embedding(x.long().squeeze(-1))  # Xử lý token IDs
+
+        # Chiếu xuống d_model nếu dùng pretrained embedding
+        if self.embed_proj is not None:
+            x = self.embed_proj(x)
 
         # Lấy đầu ra từ backbone
         sequence_output = self.backbone(x)
@@ -80,3 +100,4 @@ class MambaClassifier(nn.Module):
             output["loss"] = loss
 
         return output
+

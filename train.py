@@ -19,7 +19,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModel
 import underthesea
 import re
 
@@ -240,6 +240,7 @@ def prepare_data(config):
 def setup_model(config, tokenizer):
     """
     Khởi tạo MambaClassifier và chọn thiết bị (CUDA / MPS / CPU).
+    Trích xuất pretrained embedding từ PhoBERT nếu tokenizer_name hỗ trợ.
     Args:
         config: Cần d_model, n_layers, num_classes, dropout.
         tokenizer: Để lấy vocab_size cho embedding.
@@ -253,6 +254,15 @@ def setup_model(config, tokenizer):
         if torch.backends.mps.is_available()
         else "cpu"
     )
+
+    # Trích xuất pretrained embedding từ PhoBERT
+    print(f"Loading pretrained embeddings from {config['tokenizer_name']}...")
+    phobert = AutoModel.from_pretrained(config["tokenizer_name"])
+    pretrained_embeddings = phobert.embeddings.word_embeddings.weight.data.clone()
+    embed_dim = pretrained_embeddings.shape[1]
+    print(f"Pretrained embedding: vocab={pretrained_embeddings.shape[0]}, dim={embed_dim}")
+    del phobert  # Giải phóng bộ nhớ
+
     model = MambaClassifier(
         d_model=config["d_model"],
         n_layers=config["n_layers"],
@@ -260,8 +270,14 @@ def setup_model(config, tokenizer):
         dropout=config["dropout"],
         vocab_size=tokenizer.vocab_size,
         label_smoothing=config["label_smoothing"],
+        pretrained_embeddings=pretrained_embeddings,
     ).to(device)
-    print(f"Total parameters: {sum(p.numel() for p in model.parameters())}")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Frozen parameters: {total_params - trainable_params:,} (pretrained embedding)")
     return model, device
 
 
