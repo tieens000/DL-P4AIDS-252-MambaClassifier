@@ -19,7 +19,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer
+from huggingface_hub import hf_hub_download
 import underthesea
 import re
 
@@ -255,13 +256,32 @@ def setup_model(config, tokenizer):
         else "cpu"
     )
 
-    # Trích xuất pretrained embedding từ PhoBERT
+    # Trích xuất pretrained embedding từ PhoBERT (tải trực tiếp file weights,
+    # tránh import AutoModel gây lỗi torchvision trên Colab)
     print(f"Loading pretrained embeddings from {config['tokenizer_name']}...")
-    phobert = AutoModel.from_pretrained(config["tokenizer_name"])
-    pretrained_embeddings = phobert.embeddings.word_embeddings.weight.data.clone()
+    try:
+        # Thử safetensors trước (nhẹ hơn, nhanh hơn)
+        model_path = hf_hub_download(config["tokenizer_name"], "model.safetensors")
+        from safetensors.torch import load_file
+        state_dict = load_file(model_path)
+    except Exception:
+        # Fallback sang pytorch_model.bin
+        model_path = hf_hub_download(config["tokenizer_name"], "pytorch_model.bin")
+        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+
+    # Tìm key embedding trong state_dict
+    embed_key = None
+    for key in state_dict:
+        if "word_embeddings.weight" in key:
+            embed_key = key
+            break
+    if embed_key is None:
+        raise KeyError("Không tìm thấy word_embeddings.weight trong pretrained model.")
+
+    pretrained_embeddings = state_dict[embed_key].clone()
     embed_dim = pretrained_embeddings.shape[1]
     print(f"Pretrained embedding: vocab={pretrained_embeddings.shape[0]}, dim={embed_dim}")
-    del phobert  # Giải phóng bộ nhớ
+    del state_dict  # Giải phóng bộ nhớ
 
     model = MambaClassifier(
         d_model=config["d_model"],
