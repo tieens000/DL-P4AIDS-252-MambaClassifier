@@ -112,8 +112,6 @@ def collate_fn(batch):
     labels = torch.tensor([item["labels"] for item in batch])
     # Padding để đảm bảo tất cả các tensor có cùng chiều dài
     input_ids = pad_sequence(input_ids, batch_first=True)
-    # Thêm chiều cuối 1 để khớp đầu vào mô hình
-    input_ids = input_ids.unsqueeze(-1)
     # Trả về dict có khóa input_ids và labels
     return {"input_ids": input_ids, "labels": labels}
 
@@ -320,7 +318,7 @@ def train_epoch(model, train_loader, optimizer, device, max_grad_norm: float):
     progress_bar = tqdm(train_loader, desc="Training")
     for batch in progress_bar:
 
-        input_ids = batch["input_ids"].clone().detach().to(device).float()
+        input_ids = batch["input_ids"].clone().detach().to(device)
         labels = batch["labels"].clone().detach().to(device)
 
         outputs = model(input_ids, labels)
@@ -365,7 +363,7 @@ def evaluate(model, test_loader, device, num_classes: int):
 
     with torch.no_grad():
         for batch in test_loader:
-            input_ids = batch["input_ids"].to(device).float()
+            input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
 
             outputs = model(input_ids, labels)

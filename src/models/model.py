@@ -73,14 +73,14 @@ class MambaClassifier(nn.Module):
         Luồng xuôi: embedding → (projection) → backbone → logits; tùy chọn tính loss.
 
         Args:
-            x: Tensor (B, L, 1) (token id dạng float) hoặc tương thích.
+            x: Tensor (B, L) (token id dạng nguyên).
             labels: Tensor nhãn (B,) long; nếu None không tính loss.
 
         Returns:
             Dict có khóa logits; thêm loss nếu có labels.
         """
         # Áp dụng embedding
-        x = self.embedding(x.long().squeeze(-1))  # Xử lý token IDs
+        x = self.embedding(x)  # Xử lý token IDs
 
         # Chiếu xuống d_model nếu dùng pretrained embedding
         if self.embed_proj is not None:
