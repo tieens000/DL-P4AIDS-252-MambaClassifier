@@ -188,7 +188,7 @@ def prepare_data(config):
     Returns:
         Tuple (train_loader, val_loader, test_loader, tokenizer).
     """
-    dataset = load_dataset(config["dataset_name"])
+    dataset = load_dataset(config["dataset_name"], trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(config["tokenizer_name"])
 
     train_src = _prep_hf_split(dataset["train"])
