@@ -119,14 +119,14 @@ def collate_fn(batch):
 def get_default_config():
     """Trả về dict siêu tham số mặc định cho mô hình và huấn luyện."""
     return {
-        "d_model": 64,
+        "d_model": 128,
         "n_layers": 2,
         "num_classes": 3,  # uitnlp/vietnamese_students_feedback: sentiment 0/1/2
-        "dropout": 0.3,
-        "learning_rate": 5e-5,
-        "weight_decay": 0.1,
-        "batch_size": 32,
-        "num_epochs": 20,
+        "dropout": 0.2,
+        "learning_rate": 5e-4,
+        "weight_decay": 0.05,
+        "batch_size": 64,
+        "num_epochs": 30,
         "max_length": 256,
         "max_grad_norm": 1.0,
         "seed": 42,
@@ -134,8 +134,8 @@ def get_default_config():
         "tokenizer_name": "vinai/phobert-base",
         "scheduler_mode": "min",
         "scheduler_factor": 0.5,
-        "scheduler_patience": 2,
-        "max_patience": 5,
+        "scheduler_patience": 3,
+        "max_patience": 8,
         "label_smoothing": 0.1,
     }
 
