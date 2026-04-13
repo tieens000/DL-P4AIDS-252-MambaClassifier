@@ -447,7 +447,6 @@ def train():
         mode=config["scheduler_mode"],
         factor=config["scheduler_factor"],
         patience=config["scheduler_patience"],
-        verbose=True,
     )
 
     best_val_loss = float("inf")
